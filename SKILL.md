@@ -21,19 +21,52 @@ never stopping until interrupted.
 
 Inspired by Karpathy's autoresearch: constraint + metric + autonomous iteration = compounding gains.
 
+## Architecture — Orchestrator + Experiment Subagents
+
+This skill uses a **multi-agent architecture** to conserve context. The main conversation acts as
+a lightweight orchestrator that never reads source files or command output directly. Instead, each
+experiment runs inside a disposable subagent whose context is discarded after it reports back.
+
+```
+┌─────────────────────────────────────────────────────┐
+│  ORCHESTRATOR (main agent — stays lean)             │
+│                                                     │
+│  Reads: autoresearch.md, autoresearch-results.tsv   │
+│  Does:  REVIEW → IDEATE → spawn subagent            │
+│         ← receive result                            │
+│         DECIDE → LOG → UPDATE → repeat              │
+│                                                     │
+│  Never reads: source files, command output           │
+│  Context cost per iteration: ~200 tokens            │
+├─────────────────────────────────────────────────────┤
+│  EXPERIMENT SUBAGENT (one per iteration — disposable)│
+│                                                     │
+│  Reads: in-scope source files                       │
+│  Does:  MODIFY → COMMIT → VERIFY                   │
+│  Returns: { metric, status, commit, description }   │
+│                                                     │
+│  Context is discarded after returning result        │
+│  Context cost to orchestrator: 0                    │
+└─────────────────────────────────────────────────────┘
+```
+
+**Why this matters:** Without subagents, every iteration loads source files and verification output
+into the main context. After 15-20 iterations, the context is full and the session dies. With
+subagents, the orchestrator only accumulates ~200 tokens per iteration (the compact result), so it
+can run 100+ iterations before hitting limits.
+
 ## Quick Reference — The Loop
 
 ```
-LOOP (forever or N times):
-  1. Review state + git log + results log + session doc
-  2. Pick next change (untried > near-misses > radical)
-  3. Make ONE atomic change
-  4. Git commit (before verification — enables clean rollback)
-  5. Run verification command, parse metric
-  6. Improved → keep. Worse → revert. Crash → fix or revert.
-  7. Log result to autoresearch-results.tsv
-  8. Update autoresearch.md session document
-  9. Repeat. NEVER STOP. NEVER ask "should I continue?"
+ORCHESTRATOR LOOP (forever or N times):
+  1. REVIEW   — Read autoresearch.md + results TSV + git log (compact state only)
+  2. IDEATE   — Pick next change based on wins, dead ends, and ideas
+  3. DELEGATE — Spawn experiment subagent with change description
+     └─ SUBAGENT: read files → modify → commit → verify → return result
+  4. DECIDE   — Parse subagent result: keep / revert / fix
+  5. LOG      — Append row to autoresearch-results.tsv
+  6. UPDATE   — Update autoresearch.md (key wins, dead ends, what to try next)
+  7. REPEAT   — Go to step 1. NEVER STOP. NEVER ask "should I continue?"
 ```
 
 ## Invocation
@@ -132,50 +165,111 @@ mv autoresearch-results.tsv autoresearch-results.tsv.bak
 7. **Print setup summary and begin** — Show the configuration and immediately start looping.
    Do NOT ask "should I continue?" — the user invoked autoresearch, that IS the instruction to loop.
 
-## The Autonomous Loop
+## The Orchestrator Loop
 
-Think carefully and deeply before each iteration.
+Think carefully and deeply before each iteration. Read `references/autonomous-loop-protocol.md` for
+detailed phase-by-phase instructions including the subagent prompt template.
 
-Each iteration follows this protocol. Read `references/autonomous-loop-protocol.md` for detailed
-phase-by-phase instructions.
+### Step 1: REVIEW (orchestrator)
+
+Re-read `autoresearch.md` and `autoresearch-results.tsv`. Run `git log --oneline -10`.
+These are small files — they're the only things the orchestrator loads each iteration.
+Identify patterns in what's working, what's failing, and what hasn't been tried.
+
+### Step 2: IDEATE (orchestrator)
+
+Pick the next change. Use the "What to Try Next" section from the session doc as a starting
+point. Check "Dead Ends" to avoid repeating failures. Write a one-sentence description of the
+change you want to try.
+
+### Step 3: DELEGATE (spawn experiment subagent)
+
+Spawn a subagent with the Agent tool using this prompt structure:
 
 ```
-Phase 1: REVIEW   — Re-read results log + session doc + git log. Understand current state.
-Phase 2: IDEATE   — Pick the next change. Use session doc's "What to Try Next" as starting point.
-Phase 3: MODIFY   — Make ONE atomic change, explainable in a single sentence.
-Phase 4: COMMIT   — Stage only in-scope files, then git commit -m "autoresearch: <description>"
-Phase 5: VERIFY   — Run verify command (with timeout). Parse metric from stdout. Redirect stderr: cmd 2>&1
-Phase 6: DECIDE   — Improved → keep. Worse/equal → git revert HEAD --no-edit. Crash → fix or revert.
-Phase 7: LOG      — Append row to autoresearch-results.tsv.
-Phase 8: UPDATE   — Update autoresearch.md (key wins, dead ends, what to try next, current best).
-Phase 9: REPEAT   — Go to Phase 1. NEVER STOP.
+You are an autoresearch experiment agent. Your job is to make ONE atomic change to improve
+a metric, commit it, and run verification.
+
+GOAL: <goal>
+SCOPE: <files/directories in scope>
+METRIC: <metric name> (<direction> is better)
+VERIFY COMMAND: <command>
+TIMEOUT: <N> seconds
+CURRENT BEST: <current best metric value>
+BASELINE: <baseline metric value>
+
+CHANGE TO TRY: <one-sentence description of the change from IDEATE step>
+
+INSTRUCTIONS:
+1. Read the relevant in-scope files to understand the current code.
+2. Make the described change — ONE atomic modification.
+3. Stage only in-scope files and commit: git commit -m "autoresearch: <description>"
+4. Run the verify command with timeout: timeout <N>s <verify_command> 2>&1
+5. Parse the metric from the output.
+
+RESPOND WITH EXACTLY THIS FORMAT (nothing else):
+METRIC: <number or ERR>
+STATUS: <keep|discard|crash|checks_failed>
+COMMIT: <short hash or REVERTED>
+DESCRIPTION: <one-sentence summary of what you did>
+NOTES: <brief context for the orchestrator — why it worked/failed, what to try next>
+
+DECISION RULES:
+- If the metric improved vs current best → STATUS: keep (leave the commit)
+- If the metric is worse or equal → STATUS: discard (run: git revert HEAD --no-edit)
+- If the verify command crashed → STATUS: crash (attempt fix up to 3 times, then revert)
+- If metric improved but < 1% gain with significant complexity → STATUS: discard (revert)
 ```
 
-### Phase 8: UPDATE (session document maintenance)
+Use `subagent_type: "general-purpose"` and set `model: "sonnet"` for the subagent to keep
+iteration costs low. Use `model: "opus"` only if you're stuck (5+ consecutive discards).
 
-This phase is what makes autoresearch survive context resets. After every iteration:
+### Step 4: DECIDE (orchestrator)
+
+Parse the subagent's structured response. The subagent already handled the keep/revert decision
+and git operations. You just need to record the result.
+
+### Step 5: LOG (orchestrator)
+
+Append a row to `autoresearch-results.tsv`:
+```
+<iteration>	<commit_hash_or_dash>	<metric_value>	<delta>	<status>	<description>
+```
+
+### Step 6: UPDATE (orchestrator)
+
+Update `autoresearch.md` — this is what makes the session survive context resets:
 
 - If **keep**: Add to "Key Wins" with the metric delta.
-- If **discard**: Add to "Dead Ends" with a brief note on why it didn't work.
+- If **discard**: Add to "Dead Ends" with a brief note on why (from subagent NOTES).
 - If **crash**: Add to "Dead Ends" with the failure mode.
 - Always update "Current Best" if it changed.
 - Always refresh "What to Try Next" with 2-3 ideas based on what you've learned.
 
-A fresh agent with no memory should be able to read `autoresearch.md` + `autoresearch-results.tsv`
-and continue the session exactly where it left off.
+### Step 7: REPEAT
+
+Go to Step 1. Do not pause. Do not ask for confirmation. The loop is autonomous.
+
+## Fallback: Single-Agent Mode
+
+If the Agent tool is unavailable (no subagent support), fall back to running everything in
+the main context. This uses more context per iteration but still works. Follow the same phases
+but execute MODIFY, COMMIT, and VERIFY directly instead of delegating.
+
+When running in single-agent mode, be extra diligent about context limit handling (see below).
 
 ## Critical Rules
 
 1. **NEVER STOP.** Loop until manually interrupted. The user may be asleep.
-2. **Read before write.** Always understand full context before modifying.
+2. **Delegate the heavy work.** Source files and command output belong in subagents, not the orchestrator.
 3. **One change per iteration.** Atomic changes — if it breaks, you know exactly why.
 4. **Mechanical verification only.** No subjective "looks good." Use the metric.
 5. **Automatic rollback.** Failed changes revert instantly via git. No debates.
 6. **Simplicity wins.** Equal metric + less code = KEEP. Tiny gain + ugly complexity = DISCARD.
 7. **Git is memory.** Every kept change committed with a descriptive message.
 8. **Session doc is context.** Keep `autoresearch.md` updated so any fresh agent can resume.
-9. **When stuck, think harder.** After 5+ consecutive discards: re-read all files, review patterns,
-   combine near-misses, try the opposite, try radical changes.
+9. **When stuck, escalate.** After 5+ consecutive discards: switch subagent to opus model,
+   re-read all files in the subagent, try radical/opposite approaches.
 
 ## Progress Reporting
 
@@ -204,25 +298,25 @@ user can specify a checks command:
 Checks: npm test && npm run typecheck && npm run lint
 ```
 
-If provided, run checks AFTER a passing benchmark. If checks fail, the experiment is logged as
-`checks_failed` — the metric was valid but the change broke something else. Revert it.
-
-This prevents optimizations that break correctness.
+If provided, include the checks command in the subagent prompt. The subagent runs checks AFTER
+a passing benchmark. If checks fail, the experiment is logged as `checks_failed`.
 
 ## Crash Recovery
 
 | Failure Type              | Response                                                  |
 |---------------------------|-----------------------------------------------------------|
-| Syntax/compile error      | Fix immediately, don't count as separate iteration        |
-| Runtime error             | Attempt fix (max 3 tries), then revert and move on        |
-| Resource exhaustion (OOM) | Revert, try a smaller/simpler variant                     |
-| Hang / infinite loop      | Kill after timeout, revert, avoid that approach            |
-| External dependency fail  | Skip, log, try a different approach                       |
+| Syntax/compile error      | Subagent fixes immediately, doesn't count as separate iter|
+| Runtime error             | Subagent attempts fix (max 3 tries), then reverts         |
+| Resource exhaustion (OOM) | Subagent reverts, orchestrator notes to try simpler variant|
+| Hang / infinite loop      | Subagent kills after timeout, reverts                     |
+| External dependency fail  | Subagent skips, orchestrator tries different approach      |
 | Baseline broken           | STOP. Alert the user. Something external changed.         |
+| Subagent fails to respond | Log as crash, continue with next iteration                |
 
 ## Context Limit Handling
 
-If you sense you're approaching the context limit (very long conversation):
+The multi-agent architecture makes context limits much less likely, but if you sense you're
+approaching the limit (very long conversation):
 
 1. Update `autoresearch.md` thoroughly with everything learned so far.
 2. Print: "Approaching context limit. Session state saved to autoresearch.md. Re-invoke the autoresearch skill to resume."
@@ -230,6 +324,6 @@ If you sense you're approaching the context limit (very long conversation):
 
 ## References
 
-- `references/autonomous-loop-protocol.md` — Detailed 8-phase loop protocol with getting-unstuck guide
+- `references/autonomous-loop-protocol.md` — Detailed phase-by-phase protocol with subagent prompts and getting-unstuck guide
 - `references/core-principles.md` — 7 universal principles behind autoresearch
 - `references/results-logging.md` — TSV format specification and reporting templates

@@ -1,18 +1,29 @@
 # Autonomous Loop Protocol — Detailed Phase Instructions
 
-## Phase 1: REVIEW
+This document covers the multi-agent loop protocol. The orchestrator (main agent) stays lean by
+delegating experiment execution to disposable subagents. Each subagent reads files, makes changes,
+and runs verification — then returns a compact result and its context is discarded.
 
-Before every iteration, refresh your understanding:
+---
 
-1. Re-read `autoresearch-results.tsv` to see what's been tried and what worked.
+## Orchestrator Phases
+
+These phases run in the main agent. They work with compact data only: the session document,
+the results TSV, and git log output. The orchestrator should never read source files directly.
+
+### Phase 1: REVIEW (orchestrator)
+
+Before every iteration, refresh your understanding from the compact state files:
+
+1. Re-read `autoresearch-results.tsv` — see what's been tried and what worked.
 2. Re-read `autoresearch.md` — especially "Dead Ends" (don't repeat) and "What to Try Next."
 3. Run `git log --oneline -10` to see recent commits and reverts.
-4. Re-read any files that are relevant to your next idea.
-5. Identify patterns: What categories of changes tend to succeed? What keeps failing?
+4. Identify patterns: What categories of changes tend to succeed? What keeps failing?
 
-**Do not skip this phase.** Context drift is the #1 cause of wasted iterations.
+**Do not read source files in the orchestrator.** That's the subagent's job. The orchestrator
+reasons about strategy from the session doc and results log only.
 
-## Phase 2: IDEATE
+### Phase 2: IDEATE (orchestrator)
 
 Pick the next change using this priority order:
 
@@ -23,107 +34,84 @@ Pick the next change using this priority order:
 5. **Radical ideas** — If conservative changes are exhausted, try something bold.
 6. **Opposite approach** — If you've been stuck, try the exact opposite of your recent strategy.
 
-Write a one-sentence description of the change before making it. This becomes the commit message
-and the log entry.
+Write a one-sentence description of the change. This becomes the subagent's mission, the commit
+message, and the log entry.
 
 **Check "Dead Ends" in autoresearch.md before proceeding.** If this approach was already tried and
 failed, pick something else. Don't waste iterations on known failures.
 
-## Phase 3: MODIFY
+### Phase 3: DELEGATE (orchestrator → subagent)
 
-Make ONE atomic change:
+Spawn an experiment subagent using the Agent tool. Use `model: "sonnet"` by default for fast,
+cheap iterations. Switch to `model: "opus"` when stuck (5+ consecutive discards) for deeper
+reasoning.
 
-- The change should be explainable in a single sentence.
-- Do not bundle multiple unrelated changes. If change A helps and change B hurts, bundling them
-  together means you lose both.
-- If a change requires modifying multiple files, that's fine — "atomic" means "one logical idea."
-- Prefer the simplest implementation. You can always iterate to a more sophisticated version later.
+#### Subagent Prompt Template
 
-## Phase 4: COMMIT
+```
+You are an autoresearch experiment agent. Your job is to make ONE atomic change to improve
+a metric, commit it, and run verification. Work autonomously — do not ask questions.
 
-Commit BEFORE running verification:
+SESSION CONTEXT:
+- Goal: <goal>
+- Scope: <files/directories in scope>
+- Metric: <metric name> (<direction> is better)
+- Verify command: <command>
+- Timeout: <N> seconds
+- Current best: <current best metric value>
+- Baseline: <baseline metric value>
+- Checks command: <checks command or "none">
 
-```bash
-git add <in-scope files that changed>
-git commit -m "autoresearch: <one-sentence description>"
+CHANGE TO TRY: <one-sentence description>
+
+DEAD ENDS (do NOT retry these):
+<paste the Dead Ends section from autoresearch.md>
+
+INSTRUCTIONS:
+1. Read the relevant in-scope files to understand current code.
+2. Make the described change — ONE atomic modification, explainable in one sentence.
+   Keep it simple. If equal metric + less code, that's a win.
+3. Stage only in-scope files and commit:
+   git add <specific files>
+   git commit -m "autoresearch: <description>"
+4. Run verification:
+   timeout <N>s <verify_command> 2>&1
+5. Parse the metric value from the output.
+6. If checks command is configured and metric improved, also run:
+   timeout <N>s <checks_command> 2>&1
+7. Make the keep/revert decision:
+   - Metric improved (and checks passed if configured) → keep the commit
+   - Metric worse, equal, or crashed → git revert HEAD --no-edit
+   - Metric improved < 1% but adds significant complexity → git revert HEAD --no-edit
+   - Checks failed → git revert HEAD --no-edit (status: checks_failed)
+
+RESPOND WITH EXACTLY THIS FORMAT (nothing else after NOTES):
+METRIC: <number or ERR>
+STATUS: <keep|discard|crash|checks_failed>
+COMMIT: <7-char hash or REVERTED>
+DESCRIPTION: <one-sentence summary of what you did>
+NOTES: <2-3 sentences: why it worked/failed, observations about the code, what might work next>
 ```
 
-Stage only the files within the declared scope — never use `git add -A` or `git add .` as this
-risks staging secrets (.env, credentials), large binaries, or unrelated files. Use specific paths
-or glob patterns that match the scope. The session doc and results TSV should already be in
-`.gitignore` and won't be staged.
+#### Subagent Guidelines
 
-Why commit first? Because if verification fails or hangs, you need a clean state to revert to.
-`git revert HEAD --no-edit` cleanly undoes exactly one commit.
+- Set `description: "autoresearch iteration N"` on the Agent tool call.
+- The subagent handles everything: reading files, editing, committing, running verification,
+  and making the keep/revert decision. The orchestrator just records the result.
+- If a subagent fails to return a properly formatted response, log the iteration as `crash`
+  with COMMIT: `-` and continue.
+- Parse the subagent's response by looking for the METRIC/STATUS/COMMIT/DESCRIPTION/NOTES lines.
 
-## Phase 5: VERIFY
+### Phase 4: DECIDE (orchestrator)
 
-Run the user's verify command and capture output:
+Parse the subagent's structured result. The subagent already handled git operations (keep or
+revert). The orchestrator just needs to:
 
-```bash
-<verify_command> 2>&1
-```
+1. Extract METRIC, STATUS, COMMIT, DESCRIPTION, NOTES from the response.
+2. Calculate delta from baseline.
+3. Update current best if STATUS is `keep`.
 
-Parse the metric from the output. The metric should be a number. Common patterns:
-- Grep for a specific line: `npm test -- --coverage | grep "All files"`
-- Look for a labeled value: `SCORE: 87.3`
-- Read the last line of output
-- Parse JSON output with jq
-
-If the verify command exits with a non-zero code, treat it as a crash (see Phase 6).
-
-**Timeout:** Kill the verify command if it exceeds the configured timeout (default 120s). If the
-user provided a custom timeout in the session config, use that value. For commands known to be slow
-(e.g., full test suites, model training), a longer timeout is appropriate.
-
-### If backpressure checks are configured
-
-After a passing verification (metric parsed successfully), run the checks command:
-
-```bash
-<checks_command> 2>&1
-```
-
-If checks fail, treat the result as `checks_failed` — revert the change even though the metric
-improved. The metric improvement doesn't count if it broke correctness.
-
-## Phase 6: DECIDE
-
-Three possible outcomes:
-
-### IMPROVED (metric better than current best)
-- Status: `keep`
-- Action: Keep the commit. Update the current best metric.
-- The commit stays on the branch.
-
-### WORSE OR EQUAL (metric same or worse than current best)
-- Status: `discard`
-- Action: Revert the commit immediately.
-  ```bash
-  git revert HEAD --no-edit
-  ```
-
-### CRASHED (verify command failed, error, or unparseable output)
-- Status: `crash`
-- Action: Attempt to fix the issue (max 3 attempts). If fixed, re-run verification.
-  If not fixable after 3 attempts, revert and move on.
-  ```bash
-  git revert HEAD --no-edit
-  ```
-
-### CHECKS FAILED (metric improved but correctness checks failed)
-- Status: `checks_failed`
-- Action: Revert. The metric gain isn't worth the correctness regression.
-  ```bash
-  git revert HEAD --no-edit
-  ```
-
-### Simplicity criterion
-If the metric improved by a trivial amount (< 1% relative improvement) but the change adds
-significant complexity (many new lines, new dependencies, convoluted logic), DISCARD it.
-Small gains that make the codebase harder to maintain are not worth keeping.
-
-## Phase 7: LOG
+### Phase 5: LOG (orchestrator)
 
 Append a row to `autoresearch-results.tsv`:
 
@@ -133,26 +121,28 @@ Append a row to `autoresearch-results.tsv`:
 
 - `iteration`: Sequential number starting from 0 (baseline).
 - `commit`: The short commit hash if kept, `-` if discarded/crashed.
-- `metric`: The measured value (or `0.0` / `ERR` if crashed).
+- `metric`: The measured value (or `ERR` if crashed).
 - `delta`: Change from baseline (e.g., `+2.3` or `-0.5`). Use `0.0` for baseline.
 - `status`: One of `baseline`, `keep`, `discard`, `crash`, `checks_failed`.
 - `description`: One-sentence description of what was tried.
 
-## Phase 8: UPDATE
+### Phase 6: UPDATE (orchestrator)
 
-Update `autoresearch.md` to maintain session continuity:
+Update `autoresearch.md` to maintain session continuity. Use the subagent's NOTES to inform
+your updates — they contain observations about the code that the orchestrator can't see directly.
 
 - **If keep:** Add to "Key Wins" section: `- iter #N: <description> (<delta>)`
-- **If discard:** Add to "Dead Ends" section: `- <description> — <why it didn't work>`
-- **If crash:** Add to "Dead Ends" section: `- <description> — CRASHED: <failure mode>`
+- **If discard:** Add to "Dead Ends" section: `- <description> — <reason from NOTES>`
+- **If crash:** Add to "Dead Ends" section: `- <description> — CRASHED: <failure from NOTES>`
 - **If checks_failed:** Add to "Dead Ends" section: `- <description> — metric improved but broke checks`
 - **Always** update "Current Best" if it changed.
-- **Always** refresh "What to Try Next" with 2-3 ideas informed by what you just learned.
+- **Always** refresh "What to Try Next" with 2-3 ideas informed by the subagent's NOTES.
 
-This is the most important phase for long-running sessions. A fresh agent reading `autoresearch.md`
-should understand exactly what has been tried, what worked, what failed, and what to try next.
+This phase is critical. The NOTES field from each subagent carries forward observations that would
+otherwise be lost when the subagent's context is discarded. Weave them into the session doc so
+future subagents benefit from past observations.
 
-## Phase 9: REPEAT
+### Phase 7: REPEAT
 
 Return to Phase 1. Do not pause. Do not ask for confirmation. Do not summarize unless it's a
 10-iteration checkpoint. The loop is autonomous.
@@ -163,21 +153,23 @@ Return to Phase 1. Do not pause. Do not ask for confirmation. Do not summarize u
 
 ### After 5+ consecutive discards:
 
-1. Stop and re-read ALL in-scope files from scratch.
-2. Review the full results log for patterns.
-3. Re-read "Key Wins" — can you extend any of those successful approaches?
-4. List what has NOT been tried yet.
-5. Consider combining two near-miss changes.
-6. Try a fundamentally different approach (different algorithm, data structure, etc.).
-7. If the metric seems to have plateaued, note it but keep trying. Many plateaus have a cliff
-   on the other side if you find the right angle.
+1. Switch the subagent model to `opus` for deeper reasoning.
+2. Include more context in the subagent prompt: paste the full "Key Wins" section so the
+   subagent can build on what's worked before.
+3. Ask the subagent to try a fundamentally different approach (different algorithm, data
+   structure, etc.).
+4. Consider combining two near-miss changes into one subagent prompt.
+5. Try the exact opposite of your recent strategy.
+6. If the metric seems to have plateaued, note it in the session doc but keep trying.
+   Many plateaus have a cliff on the other side if you find the right angle.
 
 ### After 3+ consecutive crashes:
 
 1. The verify command or environment may be broken.
-2. Re-run the verify command on the current (clean) state to confirm the baseline still works.
+2. Spawn a diagnostic subagent that just runs the verify command on the current (clean) state.
 3. If the baseline is broken, STOP and alert the user.
-4. If the baseline works, the crashes are from your changes — try simpler, more conservative edits.
+4. If the baseline works, the crashes are from your changes — instruct the next subagent to
+   try simpler, more conservative edits.
 
 ### When approaching diminishing returns:
 
@@ -185,8 +177,34 @@ If the last 20 iterations have all been discards or trivial improvements (< 0.1%
 
 1. Print a status update about diminishing returns.
 2. Consider whether the goal is achievable or if you've hit a natural limit.
-3. Try 5 more radical/unconventional approaches before suggesting to the user that the metric
-   may have plateaued.
+3. Switch to opus model and try 5 more radical/unconventional approaches.
 4. If radical approaches also fail, print a summary and note that further improvement may require
    architectural changes outside the current scope.
 5. Keep looping unless explicitly told to stop — the user chose "never stop" for a reason.
+
+---
+
+## Subagent Cost Optimization
+
+The multi-agent approach has a secondary benefit: you can tune the cost/quality tradeoff per
+iteration. Here's a rough guide:
+
+| Situation                       | Subagent Model | Reasoning                             |
+|---------------------------------|----------------|---------------------------------------|
+| Normal iteration                | sonnet         | Fast, cheap, good for simple changes  |
+| Stuck (5+ discards)             | opus           | Deeper reasoning, more creative       |
+| Near the goal (< 5% remaining) | opus           | Precision matters more than speed     |
+| Crash recovery                  | sonnet         | Quick diagnostic, don't overthink     |
+| Radical/architectural change    | opus           | Needs strong understanding of codebase|
+
+---
+
+## Single-Agent Fallback
+
+If the Agent tool is unavailable, the orchestrator runs everything directly. In this mode:
+
+- Execute Phases 1-7 inline (no delegation).
+- Be extra vigilant about context limits — you're accumulating file contents and command output.
+- Prefer reading only the specific files you plan to modify, not the entire scope.
+- After each verify command, focus on parsing the metric and discard verbose output from memory.
+- Consider approaching context limit after ~15-20 iterations and save state proactively.

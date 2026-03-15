@@ -10,19 +10,42 @@ Autoresearch turns Claude into an autonomous optimization agent. Give it a measu
 
 It works on anything with a number you can measure: test speed, bundle size, code coverage, Lighthouse scores, API latency, build times, LLM training metrics, and more.
 
+## Multi-Agent Architecture
+
+Autoresearch uses an **orchestrator + subagent** pattern to stay within context limits during long-running loops.
+
+```
+┌──────────────────────────────────────────────────┐
+│  ORCHESTRATOR (main agent — stays lean)          │
+│  Reads only: autoresearch.md + results TSV       │
+│  Does: review → ideate → spawn subagent          │
+│        ← receive compact result                  │
+│        decide → log → update docs → repeat       │
+│  ~200 tokens per iteration                       │
+├──────────────────────────────────────────────────┤
+│  EXPERIMENT SUBAGENT (disposable, one per iter)  │
+│  Reads: source files, runs commands              │
+│  Does: modify → commit → verify → return result  │
+│  Context discarded after returning               │
+└──────────────────────────────────────────────────┘
+```
+
+Without subagents, the context fills up after ~15-20 iterations as source files and command output accumulate. With this architecture, the orchestrator can run **100+ iterations** because it only sees compact results from each subagent.
+
+The skill falls back to single-agent mode automatically if subagents aren't available.
+
 ## How It Works
 
 ```
-LOOP (forever or N times):
-  1. Review state + git log + results log + session doc
-  2. Pick next change (untried > near-misses > radical)
-  3. Make ONE atomic change
-  4. Git commit (before verification — enables clean rollback)
-  5. Run verification command, parse metric
-  6. Improved -> keep. Worse -> revert. Crash -> fix or revert.
-  7. Log result to autoresearch-results.tsv
-  8. Update autoresearch.md session document
-  9. Repeat. NEVER STOP.
+ORCHESTRATOR LOOP (forever or N times):
+  1. REVIEW   — Read session doc + results log + git log
+  2. IDEATE   — Pick next change from wins, dead ends, and ideas
+  3. DELEGATE — Spawn subagent with change description
+     └─ SUBAGENT: read files → modify → commit → verify → return result
+  4. DECIDE   — Parse result: keep / revert / fix
+  5. LOG      — Append row to results TSV
+  6. UPDATE   — Update session doc with outcome
+  7. REPEAT   — Never stop. Never ask "should I continue?"
 ```
 
 ## Installation
@@ -61,25 +84,27 @@ Autoresearch survives context resets. Every iteration updates two files:
 
 ```
 autoresearch/
-├── SKILL.md                                     # Main skill instructions
+├── SKILL.md                                     # Main skill — orchestrator + subagent architecture
 ├── autoresearch.skill                           # Installable package
 └── references/
-    ├── autonomous-loop-protocol.md              # Detailed 9-phase loop protocol
+    ├── autonomous-loop-protocol.md              # Detailed protocol with subagent prompt templates
     ├── core-principles.md                       # 7 universal principles
     └── results-logging.md                       # TSV format spec + reporting templates
 ```
 
 ## Key Design Decisions
 
+- **Multi-agent by default.** Subagents handle file reads and command execution so the orchestrator stays lean. Falls back to single-agent mode when subagents aren't available.
 - **One change per iteration.** Atomic changes mean you always know exactly what helped or hurt.
 - **Commit before verify.** If verification hangs, `git revert HEAD --no-edit` cleanly restores state.
 - **Stage only in-scope files.** Never `git add -A` — avoids accidentally committing secrets or unrelated files.
 - **Mechanical verification only.** No subjective "looks good." The metric decides.
 - **Simplicity wins.** Equal metric + less code = keep. Tiny gain + ugly complexity = discard.
+- **Adaptive model selection.** Uses sonnet for fast iterations, escalates to opus when stuck.
 
 ## Credits
 
-Based on the [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch) extension by [@davebcn87](https://github.com/davebcn87), adapted for Claude.
+Based on the [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch) extension by [@davebcn87](https://github.com/davebcn87), adapted for Claude with multi-agent architecture.
 
 ## License
 
